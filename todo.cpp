@@ -17,6 +17,8 @@
 #include "json.hpp" //library for json parsing
 #include <fcntl.h>
 #include <chrono>
+#include <mysql/mysql.h> 
+MYSQL*conn;
 using json=nlohmann::json;
 #define PORT 5000
 std::queue<int> taskQueue;
@@ -62,10 +64,10 @@ using Handler=std::function<void(Request&,Response&)>; //handler type for routin
 using Middleware=std::function<bool(Request&,Response&)>; //middleware type
 std::unordered_map<std::string,std::unordered_map<std::string,Handler>> router; //used to map method to handler function
 std::vector<Middleware>middlewares;
-std::unordered_map<int,todo> T; //for storage
-std::atomic<int> id{1}; //prevents race condition
+//std::unordered_map<int,todo> T; //for storage
+//std::atomic<int> id{1}; //prevents race condition
+//std::mutex dataMutex; //mutex for finding and changing the data
 std::mutex logMutex; //mutex for logging
-std::mutex dataMutex; //mutex for finding and changing the data
 //for exctracting method and path
 void parseLine(const std::string &request, std::string &method, std::string &path){
     std::stringstream ss(request);
@@ -148,14 +150,14 @@ void handleCreate(Request&req,Response&res){
                 res.body=resBody;
                 return;
             }
-            todo t;
-            t.id=id.fetch_add(1);
-            t.title=title;
-            t.status=status;
-            //locked for critical section update
-            {   
-                std::lock_guard<std::mutex> lock(dataMutex);
-                T[t.id]=t;
+            std::string query="INSERT INTO todo(title,status) VALUES('"+ title +"','" +status +"')";
+            if(mysql_query(conn,query.c_str())!=0){
+                 json er;
+                 er["error"]="Database Error";
+                 res.statusCode=500;
+                 res.statusText="Internal Server Error";
+                 res.body=er.dump();
+                 return;
             }
             json j;
             j["message"]="Todo Created";
@@ -166,21 +168,22 @@ void handleCreate(Request&req,Response&res){
 }
 void handleGet(Request&req,Response&res){
             int idd=getId(req.path);
-            todo t;
-            bool f=false;
-            //locked for critical section reading
-            { 
-             std::lock_guard<std::mutex> lock(dataMutex);   
-             if(T.find(idd)!=T.end()){
-                t=T[idd];
-                f=true;
-             }
+            std::string query="SELECT id,title,status FROM todo WHERE id="+std::to_string(idd);
+            if(mysql_query(conn,query.c_str())!=0){
+               json er;
+               er["error"]=mysql_error(conn);
+               res.statusCode=500;
+               res.statusText="Internal Server Error";
+               res.body=er.dump();
+               return;
             }
-            if(f){
+            MYSQL_RES* result=mysql_store_result(conn);
+            MYSQL_ROW row=mysql_fetch_row(result);
+            if(row){
                 json j;
-                j["id"]=t.id;
-                j["title"]=t.title;
-                j["status"]=t.status;
+                j["id"]=std::stoi(row[0]);
+                j["title"]=row[1];
+                j["status"]=row[2];
                 res.statusCode=200;
                 res.statusText="OK";
                 res.body=j.dump();
@@ -192,75 +195,78 @@ void handleGet(Request&req,Response&res){
                 res.statusText="Not Found";
                 res.body=er.dump();
             }
+            mysql_free_result(result);
 }
-void handleUpdate(Request&req,Response&res){
-            std::string title,status;
+void handleUpdate(Request& req, Response& res){
+            std::string title, status;
             int idd;
-            // JSON parsing
-            try {
-              json j=json::parse(req.body);
-              idd=j["id"];
-              title=j["title"];
-              status=j["status"];
-            } 
-            catch (const std::exception& e) {
-              json er;
-              er["error"]="Invalid JSON";
-              std::string resBody = er.dump();
-              res.statusCode=400;
-              res.statusText="Bad Request";
-              res.body=resBody;
-              return;
+            // Parse JSON
+            try{
+                 json j = json::parse(req.body);
+                 idd = j["id"];
+                 title = j["title"];
+                 status = j["status"];
             }
-            bool f=false;
-            //locked for critical section updation
-            {
-                std::lock_guard<std::mutex> lock(dataMutex);
-                if(T.find(idd)!=T.end()){
-                    T[idd].title=title;
-                    T[idd].status=status;
-                    f=true;
-                }
+            catch(const std::exception& e){
+                json er;
+                er["error"] = "Invalid JSON";
+                res.statusCode = 400;
+                res.statusText = "Bad Request";
+                res.body = er.dump();
+                return;
             }
-            if(f){
+            std::string query="UPDATE todo SET title='" +title +"', status='" +status +"' WHERE id=" +std::to_string(idd);
+            // Execute query
+            if(mysql_query(conn, query.c_str()) != 0){
+                json er;
+                er["error"] = mysql_error(conn);
+                res.statusCode = 500;
+                res.statusText = "Internal Server Error";
+                res.body = er.dump();
+                return;
+            }
+            // Check if any row was updated
+            my_ulonglong rows = mysql_affected_rows(conn);
+            if(rows>0){
                 json j;
-                j["message"]="Updated";
-                res.statusCode=200;
-                res.statusText="OK";
-                res.body=j.dump();
+                j["message"] = "Updated";
+                res.statusCode = 200;
+                res.statusText = "OK";
+                res.body = j.dump();
             }
             else{
-                json er;
-                er["error"]="Not Found";
-                res.statusCode=404;
-                res.statusText="Not Found";
-                res.body=er.dump();
+               json er;
+               er["error"] = "Not Found";
+               res.statusCode = 404;
+               res.statusText = "Not Found";
+               res.body = er.dump();
             }
 }
-void handleDelete(Request&req,Response&res){
-            int idd=getId(req.path);
-            bool f=false;
-            //locked for critical section deletion
-            {
-                std::lock_guard<std::mutex>lock(dataMutex);
-                if(T.find(idd)!=T.end()){
-                  T.erase(idd);
-                  f=true;
-                }
+void handleDelete(Request& req, Response& res){
+            int idd = getId(req.path);
+            std::string query ="DELETE FROM todo WHERE id=" +std::to_string(idd);
+            if(mysql_query(conn, query.c_str()) != 0){
+               json er;
+               er["error"] = mysql_error(conn);
+               res.statusCode = 500;
+               res.statusText = "Internal Server Error";
+               res.body = er.dump();
+               return;
             }
-            if(f){
-                json j;
-                j["message"]="Deleted";
-                res.statusCode=200;
-                res.statusText="OK";
-                res.body=j.dump();
+            my_ulonglong rows = mysql_affected_rows(conn);
+            if(rows>0){
+               json j;
+               j["message"] = "Deleted";
+               res.statusCode = 200;
+               res.statusText = "OK";
+               res.body = j.dump();
             }
             else{
-                json er;
-                er["error"]="Not Found";
-                res.statusCode=404;
-                res.statusText="Not Found";
-                res.body=er.dump();
+               json er;
+               er["error"] = "Not Found";
+               res.statusCode = 404;
+               res.statusText = "Not Found";
+               res.body = er.dump();
             }
 }
 void handleClient(int client_fd){
@@ -375,6 +381,11 @@ int main(){
         return 1;
     }
     listen(sockfd,5);
+    conn=mysql_init(NULL);
+    if(!mysql_real_connect(conn,"localhost","root","12345","todo_db",3306,NULL,0)){
+        std::cerr<<"Database connection failed\n";
+         return 1;
+    }
     std::cout <<"server running on http://localhost:5000\n";
     router["POST"]["/create"]=handleCreate;
     router["GET"]["/get"]=handleGet;
@@ -403,5 +414,6 @@ int main(){
     for(auto &t: workers){
         t.join(); //main thread stops only after executing all other threads
     }
+    mysql_close(conn);
     return 0;
 }
