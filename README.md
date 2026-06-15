@@ -1,4 +1,4 @@
-# TODO API in C++
+# TODO APIs in C++
 
 A lightweight multithreaded REST API for managing TODO items, built from scratch using C++ socket programming and MySQL for persistent storage.
 
