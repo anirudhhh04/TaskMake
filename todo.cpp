@@ -160,7 +160,9 @@ void releaseConnection(MYSQL* conn){ //for releasing
     }
     dbCv.notify_one();
 }
-
+bool isValidStatus(const std::string& status){   //for validating the status should be either pending or completed
+    return status=="Pending"||status=="Completed";
+}
 void handleCreate(Request&req,Response&res){
             std::string title,status;
             try{
@@ -173,20 +175,85 @@ void handleCreate(Request&req,Response&res){
                 res.statusCode=400;
                 res.statusText="Bad Request";
                 res.body=resBody;
-                releaseConnection(conn);
                 return;
             }
+            if(title.empty() || title.size()>100){ //for validating if title is empty or size of title is too long
+                    json er;
+                    er["error"]="Invalid title";
+                    res.statusCode=400;
+                    res.statusText="Bad Request";
+                    res.body=er.dump();
+                    return;
+            }
+            if(!isValidStatus(status)){
+                    json er;
+                    er["error"]="Invalid status";
+                    res.statusCode=400;
+                    res.statusText="Bad Request";
+                    res.body=er.dump();
+                    return;
+            }
             MYSQL* conn = acquireConnection();
-            std::string query="INSERT INTO todo(title,status) VALUES('"+ title +"','" +status +"')";
-            if(mysql_query(conn,query.c_str())!=0){
+            //mysql prepared stmts
+            MYSQL_STMT* stmt = mysql_stmt_init(conn);
+            if(stmt == nullptr){
                  json er;
-                 er["error"]="Database Error";
-                 res.statusCode=500;
-                 res.statusText="Internal Server Error";
-                 res.body=er.dump();
+                 er["error"] = "Failed to create statement";
+                 res.statusCode = 500;
+                 res.statusText = "Internal Server Error";
+                 res.body = er.dump();
                  releaseConnection(conn);
                  return;
             }
+            const char* query = "INSERT INTO todo(title,status) VALUES(?,?)"; // SQL query with placeholders(?)instead of user values
+            if(mysql_stmt_prepare(stmt, query, strlen(query))){               // Send query template to MySQL for compilation/preparation
+                    json er;
+                    er["error"] = mysql_stmt_error(stmt);
+                    res.statusCode = 500;
+                    res.statusText = "Internal Server Error";
+                    res.body = er.dump();
+                    mysql_stmt_close(stmt);
+                    releaseConnection(conn);
+                    return;
+            }
+            // Create bindings for 2 placeholders (?,?)
+            // bind[0] -> title
+            // bind[1] -> status
+            MYSQL_BIND bind[2];
+            memset(bind,0, sizeof(bind)); //initially 0
+            // Bind first placeholder (?) to title string
+            bind[0].buffer_type = MYSQL_TYPE_STRING;
+            bind[0].buffer = (char*)title.c_str();
+            bind[0].buffer_length = title.length();
+            // Bind second placeholder (?) to status string
+            bind[1].buffer_type = MYSQL_TYPE_STRING;
+            bind[1].buffer = (char*)status.c_str();
+            bind[1].buffer_length = status.length();
+            // Attach parameter values to the prepared statement
+            // MySQL now knows what values belong to each placeholder
+            if(mysql_stmt_bind_param(stmt, bind)){ //if value become 0 execution continue normally
+                     json er;
+                     er["error"] = mysql_stmt_error(stmt);
+                     res.statusCode = 500;
+                     res.statusText = "Internal Server Error";
+                     res.body = er.dump();
+                     mysql_stmt_close(stmt);
+                     releaseConnection(conn);
+                     return;
+            }
+            // Execute prepared statement with bound parameters
+            // MySQL safely inserts the values without treating them as SQL code
+            if(mysql_stmt_execute(stmt)){      
+                     json er;
+                     er["error"] = mysql_stmt_error(stmt);
+                     res.statusCode = 500;
+                     res.statusText = "Internal Server Error";
+                     res.body = er.dump();
+                     mysql_stmt_close(stmt);   
+                     releaseConnection(conn);
+                     return;
+            }
+            mysql_stmt_close(stmt); //releasing prepared stmts
             releaseConnection(conn);
             json j;
             j["message"]="Todo Created";
@@ -266,20 +333,92 @@ void handleUpdate(Request& req, Response& res){
                 res.body = er.dump();
                 return;
             }
-            MYSQL* conn = acquireConnection();
-            std::string query="UPDATE todo SET title='" +title +"', status='" +status +"' WHERE id=" +std::to_string(idd);
-            // Execute query
-            if(mysql_query(conn, query.c_str()) != 0){
+            if(idd < 1){
                 json er;
-                er["error"] = mysql_error(conn);
+                er["error"]="Invalid ID";
+                res.statusCode=400;
+                res.statusText="Bad Request";
+                res.body=er.dump();
+                return;
+            }
+            if(title.empty() || title.size()>100){
+                json er;
+                er["error"]="Invalid title";
+                res.statusCode=400;
+                res.statusText="Bad Request";
+                res.body=er.dump();
+                return;
+            }
+            if(!isValidStatus(status)){
+                json er;
+                er["error"]="Invalid status";
+                res.statusCode=400;
+                res.statusText="Bad Request";
+                res.body=er.dump();
+                return;
+            }
+            MYSQL* conn = acquireConnection();
+            MYSQL_STMT* stmt = mysql_stmt_init(conn);    // Create prepared statement object
+            if(stmt == nullptr){
+                 json er;
+                 er["error"] = "Failed to create statement";
+                 res.statusCode = 500;
+                 res.statusText = "Internal Server Error";
+                 res.body = er.dump();
+                 releaseConnection(conn);
+                 return;
+            }
+            const char* query = "UPDATE todo SET title=?, status=? WHERE id=?";     // SQL query with placeholders
+            if(mysql_stmt_prepare(stmt, query, strlen(query))){   // Send query template to MySQL
+                json er;
+                er["error"] = mysql_stmt_error(stmt);
                 res.statusCode = 500;
                 res.statusText = "Internal Server Error";
                 res.body = er.dump();
+                mysql_stmt_close(stmt);
                 releaseConnection(conn);
                 return;
             }
-            // Check if any row was updated
-            my_ulonglong rows = mysql_affected_rows(conn);
+            MYSQL_BIND bind[3]; // Create bindings for 3 placeholders (?,?,?)
+            memset(bind, 0, sizeof(bind));
+            // Length variables for strings
+            unsigned long titleLen = title.length();
+            unsigned long statusLen = status.length();
+            // First placeholder -> title
+            bind[0].buffer_type = MYSQL_TYPE_STRING;
+            bind[0].buffer = (char*)title.c_str();
+            bind[0].buffer_length = titleLen;
+            bind[0].length = &titleLen;
+            // Second placeholder -> status
+            bind[1].buffer_type = MYSQL_TYPE_STRING;
+            bind[1].buffer = (char*)status.c_str();
+            bind[1].buffer_length = statusLen;
+            bind[1].length = &statusLen;
+            // Third placeholder -> id
+            bind[2].buffer_type = MYSQL_TYPE_LONG;
+            bind[2].buffer = &idd;
+            if(mysql_stmt_bind_param(stmt, bind)){     // Attach values to placeholders
+                  json er;
+                  er["error"] = mysql_stmt_error(stmt);
+                  res.statusCode = 500;
+                  res.statusText = "Internal Server Error";
+                  res.body = er.dump();
+                  mysql_stmt_close(stmt);
+                  releaseConnection(conn);
+                  return;
+            }
+            if(mysql_stmt_execute(stmt)){              // Execute query safely
+                  json er;
+                  er["error"] = mysql_stmt_error(stmt);
+                  res.statusCode = 500;
+                  res.statusText = "Internal Server Error";
+                  res.body = er.dump();
+                  mysql_stmt_close(stmt);
+                  releaseConnection(conn);
+                  return;
+            }
+            my_ulonglong rows = mysql_stmt_affected_rows(stmt);          // Number of affected rows
+            mysql_stmt_close(stmt);
             if(rows>0){
                 json j;
                 j["message"] = "Updated";
