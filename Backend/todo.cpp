@@ -58,6 +58,9 @@ struct Response {
         std::string response;
         response="HTTP/1.1 "+std::to_string(statusCode)+" "+statusText+"\r\n";
         response+="Content-Type: "+contentType + "\r\n";
+        response+="Access-Control-Allow-Origin: *\r\n";   //Any frontend can call this backend
+        response+="Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n";
+        response+="Access-Control-Allow-Headers: Content-Type, Authorization\r\n";    //React is allowed to send request
         response+="Content-Length: "+std::to_string(body.size())+"\r\n";
         response+="\r\n";
         response+=body;
@@ -570,6 +573,15 @@ void handleClient(int client_fd){
             if(bytes<=0) break;
             req.body.append(buffer,bytes);
         }
+        if(req.method=="OPTIONS"){
+            res.statusCode = 200;
+            res.statusText = "OK";
+            res.body = "";
+            std::string response = res.toHttpString();
+            send(client_fd, response.c_str(), response.size(), 0);
+            close(client_fd);
+            return;
+        }
         //executing middlewares before routing
         for(auto &m:middlewares){
             if(!m(req,res)){
@@ -627,7 +639,7 @@ int main(){
     //connection pool
     for(int i=0;i<4;i++)  {  //4 mysql connection simultaneously
                 MYSQL* conn=mysql_init(NULL);
-                if(!mysql_real_connect( conn, "172.24.192.1", "root", "PASSWORD", "todo_db", 3306, NULL,0)) {
+                if(!mysql_real_connect( conn, "172.24.192.1", "root", "12345", "todo_db", 3306, NULL,0)) {
                         std::cerr<<"Database connection failed: " <<mysql_error(conn) <<"\n";
                         return 1;
                 }
