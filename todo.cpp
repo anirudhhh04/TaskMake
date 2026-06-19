@@ -18,13 +18,21 @@
 #include <fcntl.h>
 #include <chrono>
 #include <mysql/mysql.h> 
-MYSQL*conn;
+
 using json=nlohmann::json;
 #define PORT 5000
 std::queue<int> taskQueue;
 std::mutex queueMutex; //mutex for queue accessing
 std::condition_variable cv;
 std::atomic<bool>running{true}; //for graceful shutdown of threads
+
+std::queue<MYSQL*> connectionPool; //for multiple sql connection
+std::mutex dbMutex;
+std::condition_variable dbCv;
+
+MYSQL* acquireConnection(); //connection
+void releaseConnection(MYSQL* conn);
+
 struct todo{
     int id;
     std::string title;
@@ -136,6 +144,23 @@ bool authMiddleware(Request&req,Response&res){ //middleware for authentication
     }
     return true;
 }
+MYSQL* acquireConnection() { //for acquiring mysql connection
+    std::unique_lock<std::mutex> lock(dbMutex);
+    dbCv.wait(lock, []{
+        return !connectionPool.empty();
+    });
+    MYSQL* conn = connectionPool.front();
+    connectionPool.pop();
+    return conn;
+}
+void releaseConnection(MYSQL* conn){ //for releasing
+    {
+        std::lock_guard<std::mutex> lock(dbMutex);
+        connectionPool.push(conn);
+    }
+    dbCv.notify_one();
+}
+
 void handleCreate(Request&req,Response&res){
             std::string title,status;
             try{
@@ -148,8 +173,10 @@ void handleCreate(Request&req,Response&res){
                 res.statusCode=400;
                 res.statusText="Bad Request";
                 res.body=resBody;
+                releaseConnection(conn);
                 return;
             }
+            MYSQL* conn = acquireConnection();
             std::string query="INSERT INTO todo(title,status) VALUES('"+ title +"','" +status +"')";
             if(mysql_query(conn,query.c_str())!=0){
                  json er;
@@ -157,8 +184,10 @@ void handleCreate(Request&req,Response&res){
                  res.statusCode=500;
                  res.statusText="Internal Server Error";
                  res.body=er.dump();
+                 releaseConnection(conn);
                  return;
             }
+            releaseConnection(conn);
             json j;
             j["message"]="Todo Created";
             std::string resBody=j.dump();
@@ -168,6 +197,15 @@ void handleCreate(Request&req,Response&res){
 }
 void handleGet(Request&req,Response&res){
             int idd=getId(req.path);
+            if(idd<1){
+                    json er;
+                    er["error"] = "Invalid ID";
+                    res.statusCode = 400;
+                    res.statusText = "Bad Request";
+                    res.body = er.dump();
+                    return;
+            }
+            MYSQL* conn = acquireConnection();
             std::string query="SELECT id,title,status FROM todo WHERE id="+std::to_string(idd);
             if(mysql_query(conn,query.c_str())!=0){
                json er;
@@ -175,9 +213,20 @@ void handleGet(Request&req,Response&res){
                res.statusCode=500;
                res.statusText="Internal Server Error";
                res.body=er.dump();
+               releaseConnection(conn);
                return;
             }
             MYSQL_RES* result=mysql_store_result(conn);
+            if(result==nullptr){
+                json er;
+                er["error"]=mysql_error(conn);
+                res.statusCode=500;
+                res.statusText="Internal Server Error";
+                res.body=er.dump();
+                releaseConnection(conn);
+                return;
+
+            }
             MYSQL_ROW row=mysql_fetch_row(result);
             if(row){
                 json j;
@@ -196,6 +245,8 @@ void handleGet(Request&req,Response&res){
                 res.body=er.dump();
             }
             mysql_free_result(result);
+            releaseConnection(conn);
+            
 }
 void handleUpdate(Request& req, Response& res){
             std::string title, status;
@@ -215,6 +266,7 @@ void handleUpdate(Request& req, Response& res){
                 res.body = er.dump();
                 return;
             }
+            MYSQL* conn = acquireConnection();
             std::string query="UPDATE todo SET title='" +title +"', status='" +status +"' WHERE id=" +std::to_string(idd);
             // Execute query
             if(mysql_query(conn, query.c_str()) != 0){
@@ -223,6 +275,7 @@ void handleUpdate(Request& req, Response& res){
                 res.statusCode = 500;
                 res.statusText = "Internal Server Error";
                 res.body = er.dump();
+                releaseConnection(conn);
                 return;
             }
             // Check if any row was updated
@@ -241,9 +294,19 @@ void handleUpdate(Request& req, Response& res){
                res.statusText = "Not Found";
                res.body = er.dump();
             }
+            releaseConnection(conn);       
 }
 void handleDelete(Request& req, Response& res){
             int idd = getId(req.path);
+            if(idd<1){
+                json er;
+                er["error"]="Invalid id";
+                res.statusCode=400;
+                res.statusText="Bad Request";
+                res.body=er.dump();
+                return;
+            }
+            MYSQL* conn = acquireConnection();
             std::string query ="DELETE FROM todo WHERE id=" +std::to_string(idd);
             if(mysql_query(conn, query.c_str()) != 0){
                json er;
@@ -251,6 +314,7 @@ void handleDelete(Request& req, Response& res){
                res.statusCode = 500;
                res.statusText = "Internal Server Error";
                res.body = er.dump();
+               releaseConnection(conn);
                return;
             }
             my_ulonglong rows = mysql_affected_rows(conn);
@@ -268,6 +332,44 @@ void handleDelete(Request& req, Response& res){
                res.statusText = "Not Found";
                res.body = er.dump();
             }
+            releaseConnection(conn);
+}
+void handleGetAll(Request &req, Response &res){
+            MYSQL* conn = acquireConnection();
+            std::string query = "SELECT id, title, status FROM todo";
+            if(mysql_query(conn, query.c_str()) != 0){
+               json er;
+               er["error"] = mysql_error(conn);
+               res.statusCode = 500;
+               res.statusText = "Internal Server Error";
+               res.body = er.dump();
+               releaseConnection(conn);
+               return;
+            }
+            MYSQL_RES* result = mysql_store_result(conn);
+            if(result == nullptr){
+               json er;
+               er["error"] = mysql_error(conn);
+               res.statusCode = 500;
+               res.statusText = "Internal Server Error";
+               res.body = er.dump();
+               releaseConnection(conn);
+               return;
+            }
+            json todos = json::array();
+            MYSQL_ROW row;
+            while((row=mysql_fetch_row(result))){
+                 json todo;
+                 todo["id"] = std::stoi(row[0]);
+                 todo["title"] = row[1];
+                 todo["status"] = row[2];
+                 todos.push_back(todo);
+            }
+            mysql_free_result(result);
+            releaseConnection(conn);
+            res.statusCode = 200;
+            res.statusText = "OK";
+            res.body = todos.dump();
 }
 void handleClient(int client_fd){
         std::string rawRequest;
@@ -381,16 +483,21 @@ int main(){
         return 1;
     }
     listen(sockfd,5);
-    conn=mysql_init(NULL);
-    if(!mysql_real_connect(conn,"172.24.192.1","root","12345","todo_db",3306,NULL,0)){
-        std::cerr<<"Database connection failed: "<< mysql_error(conn)<< "\n";
-        return 1;
+    //connection pool
+    for(int i=0;i<4;i++)  {  //4 mysql connection simultaneously
+                MYSQL* conn=mysql_init(NULL);
+                if(!mysql_real_connect( conn, "172.24.192.1", "root", "12345", "todo_db", 3306, NULL,0)) {
+                        std::cerr<<"Database connection failed: " <<mysql_error(conn) <<"\n";
+                        return 1;
+                }
+                connectionPool.push(conn);
     }
     std::cout <<"server running on http://localhost:5000\n";
     router["POST"]["/create"]=handleCreate;
     router["GET"]["/get"]=handleGet;
     router["PUT"]["/update"]=handleUpdate;
     router["DELETE"]["/delete"]=handleDelete;
+    router["GET"]["/todos"]=handleGetAll;
     middlewares.push_back(loggingMiddleware);
     middlewares.push_back(authMiddleware);
     std::vector<std::thread> workers; //create thread pool with 4 workers
@@ -414,6 +521,9 @@ int main(){
     for(auto &t: workers){
         t.join(); //main thread stops only after executing all other threads
     }
-    mysql_close(conn);
+    while(!connectionPool.empty()){
+         mysql_close(connectionPool.front());
+         connectionPool.pop();
+}
     return 0;
 }
