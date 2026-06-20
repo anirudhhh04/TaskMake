@@ -147,6 +147,14 @@ bool authMiddleware(Request&req,Response&res){ //middleware for authentication
              return false;
     }
     std::string validToken = token;
+    std::cout << "\n=== AUTH DEBUG ===\n";
+    if(req.headers.find("Authorization") != req.headers.end()){
+            std::cout << "Received: "<< req.headers["Authorization"]<< "\n";
+    }
+    else{
+            std::cout << "Authorization header NOT FOUND\n";
+    }
+    std::cout << "Expected: Bearer "<< validToken << "\n";
     if(req.headers.find("Authorization")==req.headers.end() || req.headers["Authorization"]!= "Bearer "+validToken){ //checks valid header
         json er;
         er["error"]="Forbidden";
