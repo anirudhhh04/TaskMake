@@ -147,6 +147,14 @@ bool authMiddleware(Request&req,Response&res){ //middleware for authentication
              return false;
     }
     std::string validToken = token;
+     std::cout << "\n=== HEADERS RECEIVED ===\n";
+
+    for(auto &h : req.headers){
+        std::cout << h.first
+                  << " = "
+                  << h.second
+                  << "\n";
+    }
     std::cout << "\n=== AUTH DEBUG ===\n";
     if(req.headers.find("Authorization") != req.headers.end()){
             std::cout << "Received: "<< req.headers["Authorization"]<< "\n";
