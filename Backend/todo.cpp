@@ -18,9 +18,8 @@
 #include <fcntl.h>
 #include <chrono>
 #include <mysql/mysql.h> 
-
+#include <cstdlib>
 using json=nlohmann::json;
-#define PORT 5000
 std::queue<int> taskQueue;
 std::mutex queueMutex; //mutex for queue accessing
 std::condition_variable cv;
@@ -138,7 +137,16 @@ void logCompletedRequest(Request&req, Response&res){ //for centralized logging
     logRequest(req.method, req.path, status);
 }
 bool authMiddleware(Request&req,Response&res){ //middleware for authentication
-    const std::string validToken="mysecretToken";
+    if(req.routePath == "/"){
+        return true;
+    }
+    const char* token = getenv("AUTH_TOKEN");
+    if(!token){
+             res.statusCode = 500;
+             res.statusText = "Internal Server Error";
+             return false;
+    }
+    std::string validToken = token;
     if(req.headers.find("Authorization")==req.headers.end() || req.headers["Authorization"]!= "Bearer "+validToken){ //checks valid header
         json er;
         er["error"]="Forbidden";
@@ -515,6 +523,14 @@ void handleGetAll(Request &req, Response &res){
             res.statusText = "OK";
             res.body = todos.dump();
 }
+void handleRoot(Request& req, Response& res){
+        json j;
+        j["status"] = "running";
+        j["service"] = "TaskForge";
+        res.statusCode = 200;
+        res.statusText = "OK";
+        res.body = j.dump();
+}
 void handleClient(int client_fd){
         std::string rawRequest;
         char buffer[1024];
@@ -623,6 +639,11 @@ void worker(){
     }
 }
 int main(){
+    int PORT = 5000;
+    const char* envPort = getenv("PORT");
+    if(envPort){
+         PORT = std::stoi(envPort);
+    }
     int sockfd,client_fd;
     struct sockaddr_in server;
     int l=sizeof(server);
@@ -631,26 +652,39 @@ int main(){
     server.sin_family=AF_INET;
     server.sin_port=htons(PORT);
     server.sin_addr.s_addr=INADDR_ANY;
+    int opt = 1;
+    setsockopt(sockfd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));  //for enabling socket reuse
     if(bind(sockfd,(struct sockaddr*)&server,sizeof(server))<0){
         perror("Binding Failed");
         return 1;
     }
-    listen(sockfd,5);
-    //connection pool
+    listen(sockfd,128);
+    const char* DB_HOST = getenv("DB_HOST");   //for making env variables
+    const char* DB_USER = getenv("DB_USER");
+    const char* DB_PASSWORD = getenv("DB_PASSWORD");
+    const char* DB_NAME = getenv("DB_NAME");
+    const char* DB_PORT = getenv("DB_PORT");
+    unsigned int port = DB_PORT ? std::stoi(DB_PORT) : 3306;
+    if(!DB_HOST ||!DB_USER ||!DB_PASSWORD ||!DB_NAME) {
+        std::cerr<<"Database environment variables missing\n";
+        return 1;
+    }
+    //connection pool OqQnO62mXIi2jq0z
     for(int i=0;i<4;i++)  {  //4 mysql connection simultaneously
                 MYSQL* conn=mysql_init(NULL);
-                if(!mysql_real_connect( conn, "172.24.192.1", "root", "12345", "todo_db", 3306, NULL,0)) {
+                if(!mysql_real_connect( conn,DB_HOST,DB_USER,DB_PASSWORD,DB_NAME,port, NULL,0)) {
                         std::cerr<<"Database connection failed: " <<mysql_error(conn) <<"\n";
                         return 1;
                 }
                 connectionPool.push(conn);
     }
-    std::cout <<"server running on http://localhost:5000\n";
+    std::cout << "Server running on port "<< PORT << "\n";
     router["POST"]["/create"]=handleCreate;
     router["GET"]["/get"]=handleGet;
     router["PUT"]["/update"]=handleUpdate;
     router["DELETE"]["/delete"]=handleDelete;
     router["GET"]["/todos"]=handleGetAll;
+    router["GET"]["/"] = handleRoot;
     middlewares.push_back(loggingMiddleware);
     middlewares.push_back(authMiddleware);
     std::vector<std::thread> workers; //create thread pool with 4 workers
