@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
-import axios from "axios";
 import "./App.css";
-const API = "http://localhost:5000";
+import API from "./services/api.js"
 
 export default function App() {
   const [todos, setTodos] = useState([]);
@@ -9,16 +8,12 @@ export default function App() {
   const [status, setStatus] = useState("Pending");
   const [search, setSearch] = useState("");
 
-  const headers = {
-    Authorization: "Bearer mysecretToken",
-  };
-
   const fetchTodos = async () => {
     try {
-      const res = await axios.get(`${API}/todos`, { headers });
-      setTodos(res.data);
+       const res = await API.get("/todos");
+       setTodos(res.data);
     } catch (err) {
-      console.error(err);
+    console.error(err);
     }
   };
 
@@ -27,63 +22,45 @@ export default function App() {
   }, []);
 
   const createTodo = async () => {
-    if (!title.trim()) return;
-
-    try {
-      await axios.post(
-        `${API}/create`,
-        {
-          title,
-          status,
-        },
-        {
-          headers,
-        }
-      );
-
+       if (!title.trim()) return;
+       try {
+            await API.post("/create", { title, status,
+      });
       setTitle("");
       setStatus("Pending");
       fetchTodos();
-    } catch (err) {
-      console.error(err);
-    }
+      } 
+      catch (err) {
+           console.error(err);
+      }
   };
 
   const deleteTodo = async (id) => {
-    try {
-      await axios.delete(`${API}/delete?id=${id}`, {
-        headers,
-      });
+  try {
+    await API.delete(`/delete?id=${id}`);
 
-      fetchTodos();
-    } catch (err) {
-      console.error(err);
-    }
-  };
+    fetchTodos();
+  } catch (err) {
+    console.error(err);
+  }
+};
 
-  const toggleStatus = async (todo) => {
-    try {
-      await axios.put(
-        `${API}/update`,
-        {
-          id: todo.id,
-          title: todo.title,
-          status:
-            todo.status === "Pending"
-              ? "Completed"
-              : "Pending",
-        },
-        {
-          headers,
-        }
-      );
+const toggleStatus = async (todo) => {
+  try {
+    await API.put("/update", {
+      id: todo.id,
+      title: todo.title,
+      status:
+        todo.status === "Pending"
+          ? "Completed"
+          : "Pending",
+    });
 
-      fetchTodos();
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
+    fetchTodos();
+  } catch (err) {
+    console.error(err);
+  }
+};
   const filtered = todos.filter((t) =>
     t.title.toLowerCase().includes(search.toLowerCase())
   );
