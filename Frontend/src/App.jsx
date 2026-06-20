@@ -75,7 +75,7 @@ const toggleStatus = async (todo) => {
     <div className="app">
 
       <h1 className="title">
-        TaskForge
+        TaskMake
       </h1>
 
       <p className="subtitle">
