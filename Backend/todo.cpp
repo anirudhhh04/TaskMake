@@ -137,8 +137,8 @@ void logCompletedRequest(Request&req, Response&res){ //for centralized logging
     logRequest(req.method, req.path, status);
 }
 bool authMiddleware(Request&req,Response&res){ //middleware for authentication
-    if(req.routePath == "/"){
-        return true;
+    if(req.routePath == "/" || req.routePath == "/favicon.ico"){
+                 return true;
     }
     const char* token = getenv("AUTH_TOKEN");
     if(!token){
@@ -147,22 +147,6 @@ bool authMiddleware(Request&req,Response&res){ //middleware for authentication
              return false;
     }
     std::string validToken = token;
-     std::cout << "\n=== HEADERS RECEIVED ===\n";
-
-    for(auto &h : req.headers){
-        std::cout << h.first
-                  << " = "
-                  << h.second
-                  << "\n";
-    }
-    std::cout << "\n=== AUTH DEBUG ===\n";
-    if(req.headers.find("Authorization") != req.headers.end()){
-            std::cout << "Received: "<< req.headers["Authorization"]<< "\n";
-    }
-    else{
-            std::cout << "Authorization header NOT FOUND\n";
-    }
-    std::cout << "Expected: Bearer "<< validToken << "\n";
     if(req.headers.find("Authorization")==req.headers.end() || req.headers["Authorization"]!= "Bearer "+validToken){ //checks valid header
         json er;
         er["error"]="Forbidden";
@@ -506,6 +490,9 @@ void handleGetAll(Request &req, Response &res){
             MYSQL* conn = acquireConnection();
             std::string query = "SELECT id, title, status FROM todo";
             if(mysql_query(conn, query.c_str()) != 0){
+                std::cout << "MYSQL ERROR: "
+          << mysql_error(conn)
+          << std::endl;
                json er;
                er["error"] = mysql_error(conn);
                res.statusCode = 500;
