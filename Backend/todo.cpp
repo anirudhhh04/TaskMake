@@ -17,21 +17,13 @@
 #include "json.hpp" //library for json parsing
 #include <fcntl.h>
 #include <chrono>
-#include <mysql/mysql.h> 
 #include <cstdlib>
 using json=nlohmann::json;
 std::queue<int> taskQueue;
 std::mutex queueMutex; //mutex for queue accessing
+std::mutex dataMutex; //mutex for handling data
 std::condition_variable cv;
 std::atomic<bool>running{true}; //for graceful shutdown of threads
-
-std::queue<MYSQL*> connectionPool; //for multiple sql connection
-std::mutex dbMutex;
-std::condition_variable dbCv;
-
-MYSQL* acquireConnection(); //connection
-void releaseConnection(MYSQL* conn);
-
 struct todo{
     int id;
     std::string title;
@@ -70,6 +62,8 @@ void signalHandler(int signum){ //for graceful shut down
     running=false;
     cv.notify_all();
 }
+std::unordered_map<int,todo> T; //for storage
+std::atomic<int> id{1}; //prevents race condition
 using Handler=std::function<void(Request&,Response&)>; //handler type for routing
 using Middleware=std::function<bool(Request&,Response&)>; //middleware type
 std::unordered_map<std::string,std::unordered_map<std::string,Handler>> router; //used to map method to handler function
@@ -157,22 +151,7 @@ bool authMiddleware(Request&req,Response&res){ //middleware for authentication
     }
     return true;
 }
-MYSQL* acquireConnection() { //for acquiring mysql connection
-    std::unique_lock<std::mutex> lock(dbMutex);
-    dbCv.wait(lock, []{
-        return !connectionPool.empty();
-    });
-    MYSQL* conn = connectionPool.front();
-    connectionPool.pop();
-    return conn;
-}
-void releaseConnection(MYSQL* conn){ //for releasing
-    {
-        std::lock_guard<std::mutex> lock(dbMutex);
-        connectionPool.push(conn);
-    }
-    dbCv.notify_one();
-}
+
 bool isValidStatus(const std::string& status){   //for validating the status should be either pending or completed
     return status=="Pending"||status=="Completed";
 }
@@ -206,68 +185,15 @@ void handleCreate(Request&req,Response&res){
                     res.body=er.dump();
                     return;
             }
-            MYSQL* conn = acquireConnection();
-            //mysql prepared stmts
-            MYSQL_STMT* stmt = mysql_stmt_init(conn);
-            if(stmt == nullptr){
-                 json er;
-                 er["error"] = "Failed to create statement";
-                 res.statusCode = 500;
-                 res.statusText = "Internal Server Error";
-                 res.body = er.dump();
-                 releaseConnection(conn);
-                 return;
+            todo t;
+            t.id=id.fetch_add(1);
+            t.title=title;
+            t.status=status;
+            //locked for critical section update
+            {   
+                std::lock_guard<std::mutex> lock(dataMutex);
+                T[t.id]=t;
             }
-            const char* query = "INSERT INTO todo(title,status) VALUES(?,?)"; // SQL query with placeholders(?)instead of user values
-            if(mysql_stmt_prepare(stmt, query, strlen(query))){               // Send query template to MySQL for compilation/preparation
-                    json er;
-                    er["error"] = mysql_stmt_error(stmt);
-                    res.statusCode = 500;
-                    res.statusText = "Internal Server Error";
-                    res.body = er.dump();
-                    mysql_stmt_close(stmt);
-                    releaseConnection(conn);
-                    return;
-            }
-            // Create bindings for 2 placeholders (?,?)
-            // bind[0] -> title
-            // bind[1] -> status
-            MYSQL_BIND bind[2];
-            memset(bind,0, sizeof(bind)); //initially 0
-            // Bind first placeholder (?) to title string
-            bind[0].buffer_type = MYSQL_TYPE_STRING;
-            bind[0].buffer = (char*)title.c_str();
-            bind[0].buffer_length = title.length();
-            // Bind second placeholder (?) to status string
-            bind[1].buffer_type = MYSQL_TYPE_STRING;
-            bind[1].buffer = (char*)status.c_str();
-            bind[1].buffer_length = status.length();
-            // Attach parameter values to the prepared statement
-            // MySQL now knows what values belong to each placeholder
-            if(mysql_stmt_bind_param(stmt, bind)){ //if value become 0 execution continue normally
-                     json er;
-                     er["error"] = mysql_stmt_error(stmt);
-                     res.statusCode = 500;
-                     res.statusText = "Internal Server Error";
-                     res.body = er.dump();
-                     mysql_stmt_close(stmt);
-                     releaseConnection(conn);
-                     return;
-            }
-            // Execute prepared statement with bound parameters
-            // MySQL safely inserts the values without treating them as SQL code
-            if(mysql_stmt_execute(stmt)){      
-                     json er;
-                     er["error"] = mysql_stmt_error(stmt);
-                     res.statusCode = 500;
-                     res.statusText = "Internal Server Error";
-                     res.body = er.dump();
-                     mysql_stmt_close(stmt);   
-                     releaseConnection(conn);
-                     return;
-            }
-            mysql_stmt_close(stmt); //releasing prepared stmts
-            releaseConnection(conn);
             json j;
             j["message"]="Todo Created";
             std::string resBody=j.dump();
@@ -285,34 +211,21 @@ void handleGet(Request&req,Response&res){
                 res.body = er.dump();
                 return;
             }
-            MYSQL* conn = acquireConnection();
-            std::string query="SELECT id,title,status FROM todo WHERE id="+std::to_string(idd);
-            if(mysql_query(conn,query.c_str())!=0){
-               json er;
-               er["error"]=mysql_error(conn);
-               res.statusCode=500;
-               res.statusText="Internal Server Error";
-               res.body=er.dump();
-               releaseConnection(conn);
-               return;
+            todo t;
+            bool f=false;
+            //locked for critical section reading
+            { 
+             std::lock_guard<std::mutex> lock(dataMutex);   
+             if(T.find(idd)!=T.end()){
+                t=T[idd];
+                f=true;
+             }
             }
-            MYSQL_RES* result=mysql_store_result(conn);
-            if(result==nullptr){
-                json er;
-                er["error"]=mysql_error(conn);
-                res.statusCode=500;
-                res.statusText="Internal Server Error";
-                res.body=er.dump();
-                releaseConnection(conn);
-                return;
-
-            }
-            MYSQL_ROW row=mysql_fetch_row(result);
-            if(row){
+            if(f){
                 json j;
-                j["id"]=std::stoi(row[0]);
-                j["title"]=row[1];
-                j["status"]=row[2];
+                j["id"]=t.id;
+                j["title"]=t.title;
+                j["status"]=t.status;
                 res.statusCode=200;
                 res.statusText="OK";
                 res.body=j.dump();
@@ -324,9 +237,6 @@ void handleGet(Request&req,Response&res){
                 res.statusText="Not Found";
                 res.body=er.dump();
             }
-            mysql_free_result(result);
-            releaseConnection(conn);
-            
 }
 void handleUpdate(Request& req, Response& res){
             std::string title, status;
@@ -370,83 +280,30 @@ void handleUpdate(Request& req, Response& res){
                 res.body=er.dump();
                 return;
             }
-            MYSQL* conn = acquireConnection();
-            MYSQL_STMT* stmt = mysql_stmt_init(conn);    // Create prepared statement object
-            if(stmt == nullptr){
-                 json er;
-                 er["error"] = "Failed to create statement";
-                 res.statusCode = 500;
-                 res.statusText = "Internal Server Error";
-                 res.body = er.dump();
-                 releaseConnection(conn);
-                 return;
+            bool f=false;
+            //locked for critical section updation
+            {
+                std::lock_guard<std::mutex> lock(dataMutex);
+                if(T.find(idd)!=T.end()){
+                    T[idd].title=title;
+                    T[idd].status=status;
+                    f=true;
+                }
             }
-            const char* query = "UPDATE todo SET title=?, status=? WHERE id=?";     // SQL query with placeholders
-            if(mysql_stmt_prepare(stmt, query, strlen(query))){   // Send query template to MySQL
-                json er;
-                er["error"] = mysql_stmt_error(stmt);
-                res.statusCode = 500;
-                res.statusText = "Internal Server Error";
-                res.body = er.dump();
-                mysql_stmt_close(stmt);
-                releaseConnection(conn);
-                return;
-            }
-            MYSQL_BIND bind[3]; // Create bindings for 3 placeholders (?,?,?)
-            memset(bind, 0, sizeof(bind));
-            // Length variables for strings
-            unsigned long titleLen = title.length();
-            unsigned long statusLen = status.length();
-            // First placeholder -> title
-            bind[0].buffer_type = MYSQL_TYPE_STRING;
-            bind[0].buffer = (char*)title.c_str();
-            bind[0].buffer_length = titleLen;
-            bind[0].length = &titleLen;
-            // Second placeholder -> status
-            bind[1].buffer_type = MYSQL_TYPE_STRING;
-            bind[1].buffer = (char*)status.c_str();
-            bind[1].buffer_length = statusLen;
-            bind[1].length = &statusLen;
-            // Third placeholder -> id
-            bind[2].buffer_type = MYSQL_TYPE_LONG;
-            bind[2].buffer = &idd;
-            if(mysql_stmt_bind_param(stmt, bind)){     // Attach values to placeholders
-                  json er;
-                  er["error"] = mysql_stmt_error(stmt);
-                  res.statusCode = 500;
-                  res.statusText = "Internal Server Error";
-                  res.body = er.dump();
-                  mysql_stmt_close(stmt);
-                  releaseConnection(conn);
-                  return;
-            }
-            if(mysql_stmt_execute(stmt)){              // Execute query safely
-                  json er;
-                  er["error"] = mysql_stmt_error(stmt);
-                  res.statusCode = 500;
-                  res.statusText = "Internal Server Error";
-                  res.body = er.dump();
-                  mysql_stmt_close(stmt);
-                  releaseConnection(conn);
-                  return;
-            }
-            my_ulonglong rows = mysql_stmt_affected_rows(stmt);          // Number of affected rows
-            mysql_stmt_close(stmt);
-            if(rows>0){
+            if(f){
                 json j;
-                j["message"] = "Updated";
-                res.statusCode = 200;
-                res.statusText = "OK";
-                res.body = j.dump();
+                j["message"]="Updated";
+                res.statusCode=200;
+                res.statusText="OK";
+                res.body=j.dump();
             }
             else{
-               json er;
-               er["error"] = "Not Found";
-               res.statusCode = 404;
-               res.statusText = "Not Found";
-               res.body = er.dump();
-            }
-            releaseConnection(conn);       
+                json er;
+                er["error"]="Not Found";
+                res.statusCode=404;
+                res.statusText="Not Found";
+                res.body=er.dump();
+            }       
 }
 void handleDelete(Request& req, Response& res){
             int idd = getId(req.path);
@@ -458,73 +315,45 @@ void handleDelete(Request& req, Response& res){
                 res.body=er.dump();
                 return;
             }
-            MYSQL* conn = acquireConnection();
-            std::string query ="DELETE FROM todo WHERE id=" +std::to_string(idd);
-            if(mysql_query(conn, query.c_str()) != 0){
-               json er;
-               er["error"] = mysql_error(conn);
-               res.statusCode = 500;
-               res.statusText = "Internal Server Error";
-               res.body = er.dump();
-               releaseConnection(conn);
-               return;
+            bool f=false;
+            //locked for critical section deletion
+            {
+                std::lock_guard<std::mutex>lock(dataMutex);
+                if(T.find(idd)!=T.end()){
+                  T.erase(idd);
+                  f=true;
+                }
             }
-            my_ulonglong rows = mysql_affected_rows(conn);
-            if(rows>0){
-               json j;
-               j["message"] = "Deleted";
-               res.statusCode = 200;
-               res.statusText = "OK";
-               res.body = j.dump();
+            if(f){
+                json j;
+                j["message"]="Deleted";
+                res.statusCode=200;
+                res.statusText="OK";
+                res.body=j.dump();
             }
             else{
-               json er;
-               er["error"] = "Not Found";
-               res.statusCode = 404;
-               res.statusText = "Not Found";
-               res.body = er.dump();
+                json er;
+                er["error"]="Not Found";
+                res.statusCode=404;
+                res.statusText="Not Found";
+                res.body=er.dump();
             }
-            releaseConnection(conn);
 }
-void handleGetAll(Request &req, Response &res){
-            MYSQL* conn = acquireConnection();
-            std::string query = "SELECT id, title, status FROM todo";
-            if(mysql_query(conn, query.c_str()) != 0){
-                std::cout << "MYSQL ERROR: "
-          << mysql_error(conn)
-          << std::endl;
-               json er;
-               er["error"] = mysql_error(conn);
-               res.statusCode = 500;
-               res.statusText = "Internal Server Error";
-               res.body = er.dump();
-               releaseConnection(conn);
-               return;
-            }
-            MYSQL_RES* result = mysql_store_result(conn);
-            if(result == nullptr){
-               json er;
-               er["error"] = mysql_error(conn);
-               res.statusCode = 500;
-               res.statusText = "Internal Server Error";
-               res.body = er.dump();
-               releaseConnection(conn);
-               return;
-            }
-            json todos = json::array();
-            MYSQL_ROW row;
-            while((row=mysql_fetch_row(result))){
-                 json todo;
-                 todo["id"] = std::stoi(row[0]);
-                 todo["title"] = row[1];
-                 todo["status"] = row[2];
-                 todos.push_back(todo);
-            }
-            mysql_free_result(result);
-            releaseConnection(conn);
-            res.statusCode = 200;
-            res.statusText = "OK";
-            res.body = todos.dump();
+void handleGetAll(Request& req, Response& res){
+    json todos = json::array();
+    {
+        std::lock_guard<std::mutex> lock(dataMutex);
+        for(const auto& item:T){
+            json todo;
+            todo["id"] = item.second.id;
+            todo["title"] = item.second.title;
+            todo["status"] = item.second.status;
+            todos.push_back(todo);
+        }
+    }
+    res.statusCode = 200;
+    res.statusText = "OK";
+    res.body = todos.dump();
 }
 void handleRoot(Request& req, Response& res){
         json j;
@@ -641,7 +470,7 @@ void worker(){
     }
 }
 int main(){
-    int PORT = 5000;
+    int PORT=5000;
     const char* envPort = getenv("PORT");
     if(envPort){
          PORT = std::stoi(envPort);
@@ -661,25 +490,6 @@ int main(){
         return 1;
     }
     listen(sockfd,128);
-    const char* DB_HOST = getenv("DB_HOST");   //for making env variables
-    const char* DB_USER = getenv("DB_USER");
-    const char* DB_PASSWORD = getenv("DB_PASSWORD");
-    const char* DB_NAME = getenv("DB_NAME");
-    const char* DB_PORT = getenv("DB_PORT");
-    unsigned int port = DB_PORT ? std::stoi(DB_PORT) : 3306;
-    if(!DB_HOST ||!DB_USER ||!DB_PASSWORD ||!DB_NAME) {
-        std::cerr<<"Database environment variables missing\n";
-        return 1;
-    }
-    //connection pool OqQnO62mXIi2jq0z
-    for(int i=0;i<4;i++)  {  //4 mysql connection simultaneously
-                MYSQL* conn=mysql_init(NULL);
-                if(!mysql_real_connect( conn,DB_HOST,DB_USER,DB_PASSWORD,DB_NAME,port, NULL,0)) {
-                        std::cerr<<"Database connection failed: " <<mysql_error(conn) <<"\n";
-                        return 1;
-                }
-                connectionPool.push(conn);
-    }
     std::cout << "Server running on port "<< PORT << "\n";
     router["POST"]["/create"]=handleCreate;
     router["GET"]["/get"]=handleGet;
@@ -710,9 +520,5 @@ int main(){
     for(auto &t: workers){
         t.join(); //main thread stops only after executing all other threads
     }
-    while(!connectionPool.empty()){
-         mysql_close(connectionPool.front());
-         connectionPool.pop();
-}
     return 0;
 }
