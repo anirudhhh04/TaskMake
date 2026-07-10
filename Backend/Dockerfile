@@ -7,6 +7,6 @@ WORKDIR /app
 
 COPY . .
 
-RUN g++ todo_Server.cpp -o server -pthread
+RUN g++ Server.cpp -o server -pthread
 
 CMD ["./server"]
