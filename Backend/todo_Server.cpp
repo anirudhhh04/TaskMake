@@ -14,7 +14,7 @@
 #include <functional>
 #include <vector>
 #include<signal.h>
-#include "json.hpp" //library for json parsing
+#include "json.hpp"
 #include <fcntl.h>
 #include <chrono>
 #include <cstdlib>
@@ -281,7 +281,7 @@ void handleUpdate(Request& req, Response& res){
                 return;
             }
             bool f=false;
-            //locked for critical section updation
+            //locked for critical section
             {
                 std::lock_guard<std::mutex> lock(dataMutex);
                 if(T.find(idd)!=T.end()){
@@ -479,7 +479,7 @@ int main(){
     struct sockaddr_in server;
     int l=sizeof(server);
     sockfd=socket(AF_INET,SOCK_STREAM,0);
-    fcntl(sockfd, F_SETFL, O_NONBLOCK); //make socket non blocking so accept() doesnt block forever
+    fcntl(sockfd, F_SETFL, O_NONBLOCK); //make socket non blocking so accept() doesn't block forever
     server.sin_family=AF_INET;
     server.sin_port=htons(PORT);
     server.sin_addr.s_addr=INADDR_ANY;
